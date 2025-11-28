@@ -16,6 +16,14 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QAction
 
+# Windows-specific imports for detecting active window
+try:
+    import ctypes
+    from ctypes import wintypes
+    HAS_WIN32 = True
+except ImportError:
+    HAS_WIN32 = False
+
 from core.timer import PomodoroTimer, TimerState
 from core.database import Database, Task
 from core.sounds import SoundManager
@@ -23,6 +31,7 @@ from core.weather import WeatherService
 from ui.island import MiniIslandWidget
 from ui.dashboard import DashboardWidget
 from ui.fullscreen import FullscreenMode
+from ui.search_widget import SearchWidget
 from ui.styles import Theme, MIDNIGHT_STYLE
 
 
@@ -51,6 +60,7 @@ class AppController(QObject):
         self.island: Optional[MiniIslandWidget] = None
         self.dashboard: Optional[DashboardWidget] = None
         self.fullscreen: Optional[FullscreenMode] = None
+        self.search_widget: Optional[SearchWidget] = None
         self.tray_icon: Optional[QSystemTrayIcon] = None
         
         # State
@@ -59,10 +69,19 @@ class AppController(QObject):
         self._current_task: Optional[Task] = None
         self._current_session_id: Optional[int] = None
         
+        # New settings for desktop-only mode
+        self._desktop_only_mode = False
+        self._search_engine = "Google"
+        
         # Weather refresh timer (every 30 minutes)
         self._weather_timer = QTimer(self)
         self._weather_timer.timeout.connect(self._fetch_weather)
         self._weather_timer.setInterval(30 * 60 * 1000)
+        
+        # Desktop check timer (every 500ms when desktop-only mode is enabled)
+        self._desktop_check_timer = QTimer(self)
+        self._desktop_check_timer.timeout.connect(self._check_desktop_focus)
+        self._desktop_check_timer.setInterval(500)
         
         # Animation
         self._anim_group: Optional[QParallelAnimationGroup] = None
@@ -74,6 +93,10 @@ class AppController(QObject):
         break_duration = int(settings.get('break_duration', 5))
         alarm_sound = settings.get('alarm_sound', 'chime')
         
+        # New settings
+        self._desktop_only_mode = settings.get('desktop_only_mode', 'false').lower() == 'true'
+        self._search_engine = settings.get('search_engine', 'Google')
+        
         self.timer.set_work_duration(work_duration)
         self.timer.set_break_duration(break_duration)
         self.sound_manager.set_sound(alarm_sound)
@@ -83,6 +106,7 @@ class AppController(QObject):
         self.island = MiniIslandWidget()
         self.island.expand_requested.connect(self._expand_to_dashboard)
         self.island.play_pause_clicked.connect(self._toggle_timer)
+        self.island.search_clicked.connect(self._toggle_search_widget)
         
         # Create dashboard
         self.dashboard = DashboardWidget()
@@ -96,6 +120,8 @@ class AppController(QObject):
         self.dashboard.task_selected.connect(self._select_task)
         self.dashboard.setting_changed.connect(self._on_setting_changed)
         self.dashboard.fullscreen_requested.connect(self._enter_fullscreen)
+        self.dashboard.timer_duration_changed.connect(self._on_timer_duration_changed)
+        self.dashboard.daily_goal_changed.connect(self._on_daily_goal_changed)
         self.dashboard.hide()
         
         # Create fullscreen mode
@@ -103,6 +129,11 @@ class AppController(QObject):
         self.fullscreen.close_requested.connect(self._exit_fullscreen)
         self.fullscreen.play_pause_clicked.connect(self._toggle_timer)
         self.fullscreen.hide()
+        
+        # Create search widget
+        self.search_widget = SearchWidget()
+        self.search_widget.set_search_engine(self._search_engine)
+        self.search_widget.hide()
         
         # Connect timer signals
         self.timer.tick.connect(self._on_timer_tick)
@@ -125,7 +156,13 @@ class AppController(QObject):
         settings.setdefault('work_duration', '25')
         settings.setdefault('break_duration', '5')
         settings.setdefault('alarm_sound', 'chime')
+        settings.setdefault('desktop_only_mode', 'false')
+        settings.setdefault('search_engine', 'Google')
         self.dashboard.load_settings(settings)
+        
+        # Start desktop check if enabled
+        if self._desktop_only_mode:
+            self._desktop_check_timer.start()
         
         # Fetch weather
         self._fetch_weather()
@@ -233,6 +270,72 @@ class AppController(QObject):
                 weather.location
             )
     
+    def _toggle_search_widget(self):
+        """Toggle the quick search widget."""
+        if self.search_widget.isVisible():
+            self.search_widget.hide()
+        else:
+            self.search_widget.show_and_focus()
+    
+    def _check_desktop_focus(self):
+        """Check if desktop/shell is in focus and show/hide island accordingly."""
+        if not self._desktop_only_mode:
+            return
+        
+        # Don't check if we're in expanded or fullscreen mode
+        if self._is_expanded or self._is_fullscreen:
+            return
+        
+        # Don't check if search widget is open
+        if self.search_widget and self.search_widget.isVisible():
+            return
+            
+        if HAS_WIN32:
+            try:
+                # Get the foreground window
+                user32 = ctypes.windll.user32
+                hwnd = user32.GetForegroundWindow()
+                
+                if hwnd == 0:
+                    return  # No foreground window
+                
+                # Get the class name of the foreground window
+                class_name = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(hwnd, class_name, 256)
+                class_name_str = class_name.value
+                
+                # Desktop shell class names
+                desktop_classes = [
+                    "Progman",           # Desktop
+                    "WorkerW",           # Desktop worker
+                    "Shell_TrayWnd",     # Taskbar
+                    "Shell_SecondaryTrayWnd",  # Secondary taskbar
+                    "Windows.UI.Core.CoreWindow",  # Start menu, Action center
+                ]
+                
+                is_desktop = class_name_str in desktop_classes
+                
+                # Also check if it's our own window (island)
+                if self.island:
+                    try:
+                        island_hwnd = int(self.island.winId())
+                        if hwnd == island_hwnd:
+                            is_desktop = True
+                    except:
+                        pass
+                
+                # Show/hide island based on desktop focus
+                if is_desktop:
+                    if not self.island.isVisible():
+                        self.island.show()
+                        self.island.raise_()
+                else:
+                    if self.island.isVisible():
+                        self.island.hide()
+                            
+            except Exception as e:
+                pass  # Silently fail
+    
     def _expand_to_dashboard(self):
         """Animate expansion from mini island to dashboard."""
         if self._is_expanded:
@@ -260,8 +363,8 @@ class AppController(QObject):
         self.island.set_opacity(0)
         self.island.hide()
         
-        # Position and show dashboard
-        self.dashboard.setFixedSize(dashboard_width, dashboard_height)
+        # Position and show dashboard - use resize instead of setFixedSize
+        self.dashboard.resize(dashboard_width, dashboard_height)
         self.dashboard.move(dashboard_x, dashboard_y)
         self.dashboard.setWindowOpacity(0)
         self.dashboard.show()
@@ -284,6 +387,9 @@ class AppController(QObject):
             return
         
         self._is_expanded = False
+        
+        # Temporarily pause desktop check to prevent hiding the island right after it appears
+        self._desktop_check_timer.stop()
         
         # Get dashboard position
         dashboard_rect = self.dashboard.geometry()
@@ -309,6 +415,7 @@ class AppController(QObject):
         self.island.move(island_x, island_y)
         self.island.set_opacity(0)
         self.island.show()
+        self.island.raise_()
         
         # Fade in animation
         self._anim_group = QParallelAnimationGroup()
@@ -321,6 +428,10 @@ class AppController(QObject):
         self._anim_group.addAnimation(opacity_anim)
         
         self._anim_group.start()
+        
+        # Resume desktop check after a delay (if enabled)
+        if self._desktop_only_mode:
+            QTimer.singleShot(1000, self._desktop_check_timer.start)
     
     def _enter_fullscreen(self):
         """Enter fullscreen focus mode."""
@@ -339,10 +450,20 @@ class AppController(QObject):
         self._is_fullscreen = False
         self.fullscreen.hide()
         
+        # Temporarily pause desktop check
+        if self._desktop_only_mode:
+            self._desktop_check_timer.stop()
+        
         if self._is_expanded:
             self.dashboard.show()
+            self.dashboard.raise_()
         else:
             self.island.show()
+            self.island.raise_()
+        
+        # Resume desktop check after a delay (if enabled)
+        if self._desktop_only_mode:
+            QTimer.singleShot(1000, self._desktop_check_timer.start)
     
     # ============== Timer Controls ==============
     
@@ -375,7 +496,7 @@ class AppController(QObject):
         progress = self.timer.progress
         
         self.island.update_timer(time_text, progress)
-        self.dashboard.update_timer(time_text, progress)
+        self.dashboard.update_timer(time_text, progress, remaining)
         self.fullscreen.update_timer(time_text, progress)
     
     def _on_timer_state_changed(self, state: TimerState):
@@ -402,6 +523,10 @@ class AppController(QObject):
             elapsed = self.timer.config.work_duration
             self.db.end_session(self._current_session_id, elapsed, completed=True)
             self._current_session_id = None
+            
+            # Update daily goal progress
+            elapsed_minutes = elapsed // 60
+            self.db.add_to_daily_goal(elapsed_minutes)
         
         self.sound_manager.play_alarm()
         
@@ -475,8 +600,24 @@ class AppController(QObject):
         weekly = self.db.get_daily_stats(7)
         total = self.db.get_total_stats()
         self.dashboard.update_stats(today, weekly, total)
+        
+        # Update daily goal
+        goal = self.db.get_daily_goal()
+        streak = self.db.get_streak()
+        self.dashboard.update_daily_goal(goal, streak)
     
     # ============== Settings ==============
+    
+    def _on_timer_duration_changed(self, minutes: int):
+        """Handle timer duration change from presets or custom input."""
+        self.timer.set_work_duration(minutes)
+        if self.timer.state == TimerState.IDLE:
+            self._update_ui()
+    
+    def _on_daily_goal_changed(self, target_minutes: int):
+        """Handle daily goal target change."""
+        self.db.set_daily_goal_target(target_minutes)
+        self._refresh_stats()
     
     def _on_setting_changed(self, key: str, value: str):
         self.db.set_setting(key, value)
@@ -489,6 +630,19 @@ class AppController(QObject):
             self.timer.set_break_duration(int(value))
         elif key == "alarm_sound":
             self.sound_manager.set_sound(value)
+        elif key == "desktop_only_mode":
+            self._desktop_only_mode = value.lower() == 'true'
+            if self._desktop_only_mode:
+                self._desktop_check_timer.start()
+            else:
+                self._desktop_check_timer.stop()
+                # Make sure island is visible when disabled
+                if not self._is_expanded and not self._is_fullscreen:
+                    self.island.show()
+        elif key == "search_engine":
+            self._search_engine = value
+            if self.search_widget:
+                self.search_widget.set_search_engine(value)
     
     # ============== Tray Actions ==============
     
@@ -518,6 +672,10 @@ class AppController(QObject):
             elapsed = self.timer.get_elapsed_seconds()
             self.db.end_session(self._current_session_id, elapsed, completed=False)
         
+        # Stop timers
+        self._desktop_check_timer.stop()
+        self._weather_timer.stop()
+        
         self.tray_icon.hide()
         QApplication.quit()
     
@@ -526,9 +684,10 @@ class AppController(QObject):
     def _update_ui(self):
         time_text = self.timer.remaining_formatted
         progress = self.timer.progress
+        remaining = self.timer.remaining_seconds
         
         self.island.update_timer(time_text, progress)
-        self.dashboard.update_timer(time_text, progress)
+        self.dashboard.update_timer(time_text, progress, remaining)
         self.fullscreen.update_timer(time_text, progress)
 
 

@@ -43,6 +43,25 @@ class DailyStats:
     tasks_completed: int = 0
 
 
+@dataclass 
+class DailyGoal:
+    """Daily focus goal tracking."""
+    date: str
+    target_minutes: int = 120  # Default 2 hours
+    achieved_minutes: int = 0
+    
+    @property
+    def progress(self) -> float:
+        """Get goal progress as 0.0 to 1.0"""
+        if self.target_minutes <= 0:
+            return 0.0
+        return min(self.achieved_minutes / self.target_minutes, 1.0)
+    
+    @property
+    def is_achieved(self) -> bool:
+        return self.achieved_minutes >= self.target_minutes
+
+
 class Database:
     """SQLite database handler for task timer data."""
     
@@ -109,6 +128,15 @@ class Database:
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT
+            )
+        ''')
+        
+        # Daily goals table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS daily_goals (
+                date TEXT PRIMARY KEY,
+                target_minutes INTEGER DEFAULT 120,
+                achieved_minutes INTEGER DEFAULT 0
             )
         ''')
         
@@ -445,3 +473,99 @@ class Database:
         conn.close()
         
         return {row['key']: row['value'] for row in rows}
+    
+    # ============== Daily Goals Operations ==============
+    
+    def get_daily_goal(self, goal_date: Optional[str] = None) -> DailyGoal:
+        """Get daily goal for a date (defaults to today)."""
+        if goal_date is None:
+            goal_date = date.today().isoformat()
+            
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT * FROM daily_goals WHERE date = ?', (goal_date,))
+        row = cursor.fetchone()
+        
+        if row:
+            goal = DailyGoal(
+                date=row['date'],
+                target_minutes=row['target_minutes'],
+                achieved_minutes=row['achieved_minutes']
+            )
+        else:
+            # Get default goal from settings or use 120 minutes
+            default_target = int(self.get_setting('daily_goal_minutes', '120'))
+            goal = DailyGoal(date=goal_date, target_minutes=default_target)
+        
+        conn.close()
+        return goal
+    
+    def set_daily_goal_target(self, target_minutes: int, goal_date: Optional[str] = None):
+        """Set the daily goal target."""
+        if goal_date is None:
+            goal_date = date.today().isoformat()
+            
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO daily_goals (date, target_minutes)
+            VALUES (?, ?)
+            ON CONFLICT(date) DO UPDATE SET target_minutes = ?
+        ''', (goal_date, target_minutes, target_minutes))
+        
+        # Also save as default for future days
+        self.set_setting('daily_goal_minutes', str(target_minutes))
+        
+        conn.commit()
+        conn.close()
+    
+    def add_to_daily_goal(self, minutes: int, goal_date: Optional[str] = None):
+        """Add achieved minutes to daily goal."""
+        if goal_date is None:
+            goal_date = date.today().isoformat()
+            
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        # First ensure the goal exists
+        goal = self.get_daily_goal(goal_date)
+        
+        cursor.execute('''
+            INSERT INTO daily_goals (date, target_minutes, achieved_minutes)
+            VALUES (?, ?, ?)
+            ON CONFLICT(date) DO UPDATE SET achieved_minutes = achieved_minutes + ?
+        ''', (goal_date, goal.target_minutes, minutes, minutes))
+        
+        conn.commit()
+        conn.close()
+    
+    def get_streak(self) -> int:
+        """Get current streak of days where goal was achieved."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        streak = 0
+        current_date = date.today()
+        
+        while True:
+            date_str = current_date.isoformat()
+            cursor.execute('''
+                SELECT achieved_minutes, target_minutes FROM daily_goals 
+                WHERE date = ?
+            ''', (date_str,))
+            row = cursor.fetchone()
+            
+            if row and row['achieved_minutes'] >= row['target_minutes']:
+                streak += 1
+                current_date -= timedelta(days=1)
+            else:
+                # If it's today and we haven't achieved yet, check yesterday
+                if current_date == date.today() and streak == 0:
+                    current_date -= timedelta(days=1)
+                    continue
+                break
+        
+        conn.close()
+        return streak
